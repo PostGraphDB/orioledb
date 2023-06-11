@@ -1,9 +1,16 @@
 name: benchmark
 
 on:
-  push:
-  pull_request:
-
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: 'EC2 Instance Type'
+        required: true
+        default: 'c5d.metal'
+      args:
+        description: 'Benchmark script args'
+        required: true
+        default: '--shared_buffers=32GB --max_wal_size=4GB --clients=160,180,200,220,240 --max_connections=300 --time=60 --engines=orioledb,builtin --tests=read-only-9,read-write-proc --scale=1000 --base_dir=/mnt'
 jobs:
   start-runner:
     name: Start self-hosted EC2 runner
@@ -26,7 +33,7 @@ jobs:
           github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
           runner-user: ubuntu
           ec2-image-id: ami-02e2a649d220de1f5
-          ec2-instance-type: t2.2xlarge
+          ec2-instance-type: ${{ github.event.inputs.instance_type }}
           subnet-id: subnet-04b4e8ee77472631f
           security-group-id: sg-0f1853a1ae02202b5
           aws-resource-tags: > # optional, requires additional permissions
@@ -34,7 +41,7 @@ jobs:
               {"Key": "Name", "Value": "ec2-github-runner"},
               {"Key": "GitHubRepository", "Value": "${{ github.repository }}"}
             ]
-  do-the-job:
+  run-benchmark:
     name: Do the job on the runner
     needs: start-runner # required to start the main job when the runner is ready
     runs-on: ${{ needs.start-runner.outputs.label }} # run the job on the newly created runner
@@ -68,20 +75,27 @@ jobs:
         run: bash ./orioledb/ci/prerequisites.sh
       - name: Build
         run: bash ./orioledb/ci/build.sh
-      - name: Check
-        run: bash ./orioledb/ci/check.sh
-      - name: Check output
-        run: bash ./orioledb/ci/check_output.sh
-        if: ${{ success() || failure() }}
-      - name: Codecov
-        run: bash ./orioledb/ci/codecov.sh
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Benchmark
+        run: |
+          ulimit -n 65535
+          sudo systemctl daemon-reload
+          if [ -b /dev/nvme1n1 ]; then
+            sudo mkfs -t ext4 /dev/nvme1n1
+            sudo mount /dev/nvme1n1 /mnt
+          fi
+          sudo chown ubuntu:ubuntu /mnt
+          sudo sysctl -w vm.nr_hugepages=`grep MemTotal /proc/meminfo | awk '{print int($2/2048/2)}'`
+          PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH" python3 ./orioledb/ci/pgbench.py ${{ github.event.inputs.args }} --results_dir=$GITHUB_WORKSPACE/results
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: results
+          path: results/
   stop-runner:
     name: Stop self-hosted EC2 runner
     needs:
       - start-runner # required to get output from the start-runner job
-      - do-the-job # required to wait when the main job is done
+      - run-benchmark # required to wait when the main job is done
     runs-on: ubuntu-latest
     if: ${{ always() }} # required to stop the runner even if the error happened in the previous jobs
     steps:
